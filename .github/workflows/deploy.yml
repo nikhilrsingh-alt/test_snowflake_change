@@ -137,7 +137,7 @@ jobs:
         run: |
           schemachange \
             -f migrations \
-            -c "${DB_RESOLVED}.PUBLIC.CHANGE_HISTORY" \
+            -c "${DB_RESOLVED}.GITHUB.CHANGE_HISTORY" \
             --dry-run \
             --create-change-history-table \
             --connection-name ci
@@ -146,7 +146,7 @@ jobs:
         run: |
           schemachange \
             -f migrations \
-            -c "${DB_RESOLVED}.PUBLIC.CHANGE_HISTORY" \
+            -c "${DB_RESOLVED}.GITHUB.CHANGE_HISTORY" \
             --create-change-history-table \
             --connection-name ci
 
