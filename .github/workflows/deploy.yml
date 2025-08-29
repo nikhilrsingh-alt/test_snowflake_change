@@ -1,0 +1,172 @@
+name: Deploy Snowflake
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Environment to deploy"
+        required: true
+        type: choice
+        options: [DEV, SIT, UAT, PPRD, PRD]
+      use_azure_keyvault:
+        description: "Fetch Snowflake creds from Azure Key Vault instead of GitHub secrets"
+        required: true
+        type: choice
+        options: [false, true]
+        default: false
+      backup_before_deploy:
+        description: "Create a zero-copy database clone backup before deployment"
+        required: true
+        type: choice
+        options: [false, true]
+        default: true
+
+permissions:
+  contents: read
+  id-token: write   # required for Azure OIDC
+
+jobs:
+  deploy:
+    # Triggers Environment protection rules (add Kipi + Customer approvers in SIT/UAT/PPRD/PRD)
+    environment: ${{ inputs.target_env }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install schemachange==4.0.1 snowflake-connector-python
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      # ---------- OPTIONAL: Azure Key Vault path ----------
+      - name: Azure Login (OIDC)
+        if: ${{ inputs.use_azure_keyvault == 'true' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Fetch secrets from Azure Key Vault via Azure CLI
+        if: ${{ inputs.use_azure_keyvault == 'true' }}
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            ENV_LC=$(echo "${{ inputs.target_env }}" | tr '[:upper:]' '[:lower:]')
+
+            acct=$(az keyvault secret show --vault-name "${{ secrets.AZURE_KEYVAULT_NAME }}" --name "sf-account-$ENV_LC"   --query value -o tsv)
+            user=$(az keyvault secret show --vault-name "${{ secrets.AZURE_KEYVAULT_NAME }}" --name "sf-user-$ENV_LC"      --query value -o tsv)
+            pwd=$( az keyvault secret show --vault-name "${{ secrets.AZURE_KEYVAULT_NAME }}" --name "sf-password-$ENV_LC"  --query value -o tsv)
+            role=$(az keyvault secret show --vault-name "${{ secrets.AZURE_KEYVAULT_NAME }}" --name "sf-role-$ENV_LC"      --query value -o tsv)
+            wh=$(  az keyvault secret show --vault-name "${{ secrets.AZURE_KEYVAULT_NAME }}" --name "sf-warehouse-$ENV_LC" --query value -o tsv)
+            db=$(  az keyvault secret show --vault-name "${{ secrets.AZURE_KEYVAULT_NAME }}" --name "sf-database-$ENV_LC"  --query value -o tsv)
+
+            echo "SF_ACCOUNT=$acct" >> $GITHUB_ENV
+            echo "SF_USER=$user"     >> $GITHUB_ENV
+            echo "SF_PWD=$pwd"       >> $GITHUB_ENV
+            echo "SF_ROLE=$role"     >> $GITHUB_ENV
+            echo "SF_WH=$wh"         >> $GITHUB_ENV
+            echo "SF_DB=$db"         >> $GITHUB_ENV
+
+            echo "::add-mask::$pwd"
+
+      # ---------- Resolve variables (KV wins; else fall back to environment secrets) ----------
+      - name: Resolve connection variables
+        env:
+          GH_SF_ACCOUNT: ${{ secrets.SF_ACCOUNT }}
+          GH_SF_USER:    ${{ secrets.SF_USER }}
+          GH_SF_PWD:     ${{ secrets.SF_PWD }}
+          GH_SF_ROLE:    ${{ secrets.SF_ROLE }}
+          GH_SF_WH:      ${{ secrets.SF_WH }}
+          GH_SF_DB:      ${{ secrets.SF_DB }}
+        run: |
+          echo "ACCOUNT_RESOLVED=${SF_ACCOUNT:-$GH_SF_ACCOUNT}" >> $GITHUB_ENV
+          echo "USER_RESOLVED=${SF_USER:-$GH_SF_USER}"         >> $GITHUB_ENV
+          echo "PWD_RESOLVED=${SF_PWD:-$GH_SF_PWD}"            >> $GITHUB_ENV
+          echo "ROLE_RESOLVED=${SF_ROLE:-$GH_SF_ROLE}"         >> $GITHUB_ENV
+          echo "WH_RESOLVED=${SF_WH:-$GH_SF_WH}"               >> $GITHUB_ENV
+          echo "DB_RESOLVED=${SF_DB:-$GH_SF_DB}"               >> $GITHUB_ENV
+          echo "::add-mask::${SF_PWD:-$GH_SF_PWD}"
+
+      - name: Write connections.toml
+        run: |
+          mkdir -p ~/.snowflake
+          cat > ~/.snowflake/connections.toml << EOF
+          [ci]
+          account   = "${ACCOUNT_RESOLVED}"
+          user      = "${USER_RESOLVED}"
+          role      = "${ROLE_RESOLVED}"
+          warehouse = "${WH_RESOLVED}"
+          database  = "${DB_RESOLVED}"
+          password  = "${PWD_RESOLVED}"
+          EOF
+          chmod 600 ~/.snowflake/connections.toml
+
+      # ---------- Optional backup (zero-copy clone) ----------
+      - name: Pre-deploy backup (DB clone)
+        if: ${{ inputs.backup_before_deploy == 'true' && inputs.target_env != 'DEV' }}
+        run: |
+          python - <<'PY'
+          import os, snowflake.connector
+          con = snowflake.connector.connect(
+            account=os.environ['ACCOUNT_RESOLVED'],
+            user=os.environ['USER_RESOLVED'],
+            password=os.environ['PWD_RESOLVED'],
+            warehouse=os.environ['WH_RESOLVED'],
+            role=os.environ['ROLE_RESOLVED'],
+          )
+          db = os.environ['DB_RESOLVED']
+          cs = con.cursor()
+          cs.execute("SET TS = TO_TIMESTAMP_LTZ(CURRENT_TIMESTAMP())")  # <-- use '='
+          cs.execute(f"CREATE OR REPLACE DATABASE {db}_PREDEPLOY_CLONE CLONE {db}")
+          # Example using the variable later:
+          # cs.execute(f\"CREATE OR REPLACE DATABASE {db}_ROLLBACK CLONE {db} AT (TIMESTAMP => $TS)\")
+          cs.close(); con.close()
+          PY
+
+      - name: Dry run (visibility)
+        run: |
+          schemachange \
+            -f migrations \
+            -c "${DB_RESOLVED}.PUBLIC.CHANGE_HISTORY" \
+            --dry-run \
+            --create-change-history-table \
+            --connection-name ci
+
+      - name: Deploy
+        run: |
+          schemachange \
+            -f migrations \
+            -c "${DB_RESOLVED}.PUBLIC.CHANGE_HISTORY" \
+            --create-change-history-table \
+            --connection-name ci
+
+      # ---------- Notifications (set in each Environment) ----------
+      - name: Notify via Microsoft Teams (preferred)
+        if: always()
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          if [ -n "$TEAMS_WEBHOOK_URL" ]; then
+            payload=$(jq -n --arg s "${{ job.status }}" --arg e "${{ inputs.target_env }}" '{text:("Snowflake deploy to "+$e+" => "+$s)}')
+            curl -s -X POST -H 'Content-Type: application/json' -d "$payload" "$TEAMS_WEBHOOK_URL" || true
+          fi
+
+      - name: Notify via Slack (optional)
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            payload=$(jq -n --arg s "${{ job.status }}" --arg e "${{ inputs.target_env }}" '{text:("Snowflake deploy to "+$e+" => "+$s)}')
+            curl -s -X POST -H 'Content-Type: application/json' -d "$payload" "$SLACK_WEBHOOK_URL" || true
+          fi
